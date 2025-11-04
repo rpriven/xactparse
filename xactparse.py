@@ -55,50 +55,300 @@ def is_line_item(line):
     return bool(re.match(r"^\d+\.", line.strip()))
 
 
+def should_skip_line(line):
+    """
+    Determine if a line should be skipped (not a line item).
+    Returns True for dimensions, totals, notes, headers, etc.
+    """
+    line_lower = line.lower()
+
+    # Skip dimension headers and dimension lines
+    if 'dimension' in line_lower:
+        return True
+
+    # Skip total/subtotal lines
+    if any(keyword in line_lower for keyword in ['total:', 'subtotal:', 'grand total', 'line item total']):
+        return True
+
+    # Skip section headers and notes
+    if any(keyword in line_lower for keyword in ['**contents**', '**claim info**', '**summary**', 'estimate summary', 'adjuster summary']):
+        return True
+
+    # Skip lines that are just headers or instructions
+    if any(keyword in line_lower for keyword in ['receipts must be', 'items on receipts', 'the receipt should contain', 'additional documentation']):
+        return True
+
+    # Skip lines with "SF" or other units but no leading number (these are dimension headers)
+    if re.match(r'^\s*[A-Z\s]+(?:SF|LF|EA)\s*$', line, re.IGNORECASE):
+        return True
+
+    return False
+
+
 def extract_xactimate_items(pdf_path):
     extracted_items = []
-    # Flexible regex for line items, robust to both (0.00) and <0.00>
-    line_item_regex = re.compile(
-        r"^(\d+\.)\s+(.+?)\s+([\d,.]+(?:SF|DA|HR|LF|EA|SY|UN|MO|WK|DY|BD|FT|YD|IN|CM|M|MM|LB|KG|GM|L|GAL|PC|SET|SQ|BOX|ROLL)?)\s+"
-        r"([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)\s+[\(<]([\d,.]+)[\)>]\s+([\d,.]+)(?:\s|$)"
+
+    # Multiple regex patterns to try in order (fallback logic)
+    # Pattern 1: Full format with AGE/LIFE and CONDITION
+    # Format: NUMBER. DESCRIPTION QTY+UNIT UNIT_PRICE TAX O&P RCV AGE/LIFE [yrs] Text COND% (DEPREC) ACV
+    # Example: 1. Remove... 13.49SQ 7.27 0.00 9.80 107.87 9/NA Avg. 0% (0.00) 107.87
+    pattern_with_age_life = re.compile(
+        r"^(\d+\.)\s+"  # Line number with period
+        r"(.+?)\s+"  # Description (non-greedy, allow special chars)
+        r"([\d,.]+)([A-Z]{2,4})\s+"  # Quantity+unit combined (no space): 13.49SQ
+        r"([\d,.]+)\s+"  # Unit price
+        r"([\d,.]+)\s+"  # Tax
+        r"([\d,.]+)\s+"  # O&P
+        r"([\d,.]+)\s+"  # RCV
+        r"[\d/NA]+\s+"  # AGE/LIFE (e.g., "9/30" or "9/NA" or "0/30")
+        r"(?:yrs?\s+)?"  # Optional "yrs" or "yr"
+        r"[A-Za-z.]+\s+"  # Text like "Avg."
+        r"\d+(?:\.\d+)?%\s+"  # CONDITION percentage (e.g., "30%" or "25.71%")
+        r"(?:\[M\]\s+)?"  # Optional depreciation marker [M]
+        r"\(([\d,.]+)\)\s+"  # Depreciation in parentheses
+        r"([\d,.]+)"  # ACV
+        r"(?:\s|$)"  # End with whitespace or end of line
     )
+
+    # Pattern 6: State Farm 3-line format (CONDITION on separate line AFTER deprec/ACV)
+    # Format: NUMBER. DESCRIPTION QTY+UNIT UNIT_PRICE TAX O&P RCV AGE/LIFE [yrs] (DEPREC) ACV
+    # Next line: Text COND%
+    # Example: 2. Laminated... 19.67SQ 433.28 310.68 1,766.66 10,599.96 8/30 yrs (2,826.65) 7,773.31
+    #          Avg. 26.67%
+    pattern_state_farm = re.compile(
+        r"^(\d+\.)\s+"  # Line number with period
+        r"(.+?)\s+"  # Description (non-greedy, allow special chars)
+        r"([\d,.]+)([A-Z]{2,4})\s+"  # Quantity+unit combined (no space): 19.67SQ
+        r"([\d,.]+)\s+"  # Unit price
+        r"([\d,.]+)\s+"  # Tax
+        r"([\d,.]+)\s+"  # O&P
+        r"([\d,.]+)\s+"  # RCV
+        r"[\d/NA]+\s+"  # AGE/LIFE (e.g., "8/30")
+        r"(?:yrs?\s+)?"  # Optional "yrs" or "yr"
+        r"\(([\d,.]+)\)\s+"  # Depreciation in parentheses (NO CONDITION before this!)
+        r"([\d,.]+)"  # ACV
+        r"(?:\s|$)"  # End with whitespace or end of line
+    )
+
+    # Pattern 2: Simple format without AGE/LIFE columns
+    # Format: NUMBER. DESCRIPTION QTY+UNIT UNIT_PRICE TAX O&P RCV (DEPREC) ACV
+    # Example: 52. R&R Vinyl window... 3.00EA 895.87 195.90 288.36 3,171.87 (951.56) 2,220.31
+    pattern_simple = re.compile(
+        r"^(\d+\.)\s+"  # Line number with period
+        r"(.+?)\s+"  # Description (non-greedy, allow special chars)
+        r"([\d,.]+)([A-Z]{2,4})\s+"  # Quantity+unit combined (no space)
+        r"([\d,.]+)\s+"  # Unit price
+        r"([\d,.]+)\s+"  # Tax
+        r"([\d,.]+)\s+"  # O&P
+        r"([\d,.]+)\s+"  # RCV
+        r"[\(<]([\d,.]+)[\)>]\s+"  # Depreciation (parentheses or angle brackets)
+        r"([\d,.]+)"  # ACV
+        r"(?:\s|$)"  # End with whitespace or end of line
+    )
+
+    # Pattern 3: Alternative format with angle brackets for depreciation
+    # Format: NUMBER. DESCRIPTION QTY UNIT UNIT_PRICE TAX O&P RCV <DEPREC> ACV
+    pattern_angle_brackets = re.compile(
+        r"^(\d+\.)\s+"  # Line number with period
+        r"(.+?)\s+"  # Description (non-greedy)
+        r"([\d,.]+)\s+"  # Quantity
+        r"([A-Z]{2,4})\s+"  # Unit (separate from quantity)
+        r"([\d,.]+)\s+"  # Unit price
+        r"([\d,.]+)\s+"  # Tax
+        r"([\d,.]+)\s+"  # O&P
+        r"([\d,.]+)\s+"  # RCV
+        r"<([\d,.]+)>\s+"  # Depreciation in angle brackets
+        r"([\d,.]+)"  # ACV
+        r"(?:\s|$)"  # End with whitespace or end of line
+    )
+
+    # Pattern 4: No TAX/O&P columns (Allstate LS format)
+    # Format: NUMBER. DESCRIPTION QTY+UNIT UNIT_PRICE RCV AGE/LIFE [yrs] Text COND% (DEPREC) ACV
+    # Example: 19. Paint trim - one coat 18.00LF 1.06 19.08 0/15 yrs Avg. 0% (0.00) 19.08
+    # Alt:     1. Remove Laminated... 13.74SQ 82.16 1,128.88 0/30 yrs Avg. NA (0.00) 1,128.88
+    pattern_no_tax_op = re.compile(
+        r"^(\d+\.)\s+"  # Line number with period
+        r"(.+?)\s+"  # Description (non-greedy, allow special chars)
+        r"([\d,.]+)([A-Z]{2,4})\s+"  # Quantity+unit combined (no space): 18.00LF
+        r"([\d,.]+)\s+"  # Unit price
+        r"([\d,.]+)\s+"  # RCV (no tax, no O&P!)
+        r"[\d/NA]+\s+"  # AGE/LIFE (e.g., "0/15" or "6/30")
+        r"(?:yrs?\s+)?"  # Optional "yrs" or "yr"
+        r"[A-Za-z.]+\s+"  # Text like "Avg."
+        r"(?:\d+(?:\.\d+)?%|NA)\s+"  # CONDITION: percentage (e.g., "0%" or "20%") OR "NA"
+        r"(?:\[M\]\s+)?"  # Optional depreciation marker [M]
+        r"[\(<]([\d,.]+)[\)>]\s+"  # Depreciation (parentheses or angle brackets)
+        r"([\d,.]+)"  # ACV
+        r"(?:\s|$)"  # End with whitespace or end of line
+    )
+
+    # Pattern 5: Has TAX but NO O&P (State Farm/Travelers multi-line)
+    # Format: NUMBER. DESCRIPTION QTY+UNIT UNIT_PRICE TAX RCV AGE/LIFE [yrs] Text COND (DEPREC) ACV
+    # Example: 1. Tandem axle dump... 1.00EA 325.65 0.00 325.65 10/NA Avg. NA (0.00) 325.65
+    pattern_tax_no_op = re.compile(
+        r"^(\d+\.)\s+"  # Line number with period
+        r"(.+?)\s+"  # Description (non-greedy, allow special chars)
+        r"([\d,.]+)([A-Z]{2,4})\s+"  # Quantity+unit combined (no space): 1.00EA
+        r"([\d,.]+)\s+"  # Unit price
+        r"([\d,.]+)\s+"  # TAX (has tax!)
+        r"([\d,.]+)\s+"  # RCV (NO O&P!)
+        r"[\d/NA]+\s+"  # AGE/LIFE (e.g., "10/NA" or "10/25")
+        r"(?:yrs?\s+)?"  # Optional "yrs" or "yr"
+        r"[A-Za-z.]+\s+"  # Text like "Avg."
+        r"(?:\d+(?:\.\d+)?%|NA)\s+"  # CONDITION: percentage (e.g., "40%") OR "NA"
+        r"(?:\[M\]\s+)?"  # Optional depreciation marker [M]
+        r"[\(<]([\d,.]+)[\)>]\s+"  # Depreciation (parentheses or angle brackets)
+        r"([\d,.]+)"  # ACV
+        r"(?:\s|$)"  # End with whitespace or end of line
+    )
+
+    # List of patterns to try in order
+    patterns = [
+        ("with_age_life", pattern_with_age_life, "tax_op"),  # Has tax AND O&P, inline CONDITION
+        ("state_farm", pattern_state_farm, "tax_op"),  # State Farm 3-line (CONDITION on line 3)
+        ("tax_no_op", pattern_tax_no_op, "tax_only"),  # Has tax but NO O&P
+        ("no_tax_op", pattern_no_tax_op, "no_tax_op"),  # NO tax, NO O&P
+        ("simple", pattern_simple, "tax_op"),  # Has tax AND O&P
+        ("angle_brackets", pattern_angle_brackets, "tax_op")  # Has tax AND O&P
+    ]
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_number, page in enumerate(pdf.pages, 1):
             text = page.extract_text()
             if not text:
                 continue
+
             lines = text.split('\n')
             i = 0
+
             while i < len(lines):
                 line = lines[i].strip()
+
+                # Check if this line should be skipped
+                if should_skip_line(line):
+                    i += 1
+                    continue
+
                 # Detect start of a new item (number. ...)
                 if re.match(r"^\d+\.\s", line):
-                    combined_line = line
-                    j = i + 1
-                    # Combine with following lines that are not new items
-                    while j < len(lines) and not re.match(r"^\d+\.\s", lines[j]):
-                        combined_line += " " + lines[j].strip()
-                        j += 1
-                    match = line_item_regex.match(combined_line)
+                    # Check if this might be a multi-line format (State Farm/Travelers style)
+                    # Where description is on one line and numbers are on the next
+                    is_multiline = False
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        # If next line starts with quantity+unit pattern (e.g., "1.00EA"), it's multi-line
+                        if re.match(r"^[\d,.]+[A-Z]{2,4}\s", next_line):
+                            is_multiline = True
+                            combined_line = line + " " + next_line
+                            j = i + 2  # Skip both lines
+                        else:
+                            # Standard multi-line combining
+                            combined_line = line
+                            j = i + 1
+
+                            # Combine with following lines that are not new items
+                            # Stop if we hit another numbered item, a skip pattern, or empty line
+                            while j < len(lines):
+                                next_line = lines[j].strip()
+
+                                # Stop if new numbered item
+                                if re.match(r"^\d+\.\s", next_line):
+                                    break
+
+                                # Stop if this is a skip pattern
+                                if should_skip_line(next_line):
+                                    break
+
+                                # Stop if empty line
+                                if not next_line:
+                                    break
+
+                                # Continue combining if it looks like a continuation
+                                combined_line += " " + next_line
+                                j += 1
+                    else:
+                        combined_line = line
+                        j = i + 1
+
+                    # Try each pattern in order until one matches
+                    match = None
+                    matched_pattern = None
+                    has_tax_op = True
+
+                    for pattern_name, pattern, has_tax in patterns:
+                        match = pattern.match(combined_line)
+                        if match:
+                            matched_pattern = pattern_name
+                            has_tax_op = has_tax
+                            break
+
                     if match:
-                        description = match.group(1) + " " + match.group(2)
-                        quantity_unit = match.group(3)
-                        unit_price = match.group(4)
-                        tax = match.group(5)
-                        o_p = match.group(6)
-                        rcv = match.group(7)
-                        deprec = match.group(8)
-                        acv = match.group(9)
+                        # Extract fields - pattern structure varies
+                        line_num = match.group(1)
+                        description = match.group(2).strip()
+                        quantity = match.group(3)
+                        unit = match.group(4)
+                        unit_price = match.group(5)
+
+                        # Special handling for State Farm 3-line format
+                        # Check if next line (after combined_line) contains CONDITION percentage
+                        if matched_pattern == "state_farm":
+                            # j points to the line after the combined line
+                            # Check if that line has "Avg. XX%"
+                            if j < len(lines):
+                                condition_line = lines[j].strip()
+                                # Match lines like "Avg. 26.67%" or "Avg. 0%"
+                                if re.match(r'^[A-Za-z.]+\s+\d+(?:\.\d+)?%', condition_line):
+                                    # Found CONDITION line, skip it
+                                    j += 1
+                                # Also skip blank lines after CONDITION
+                                while j < len(lines) and not lines[j].strip():
+                                    j += 1
+
+                        if has_tax_op == "tax_op":
+                            # Patterns with TAX and O&P columns
+                            tax = match.group(6)
+                            o_p = match.group(7)
+                            rcv = match.group(8)
+                            deprec = match.group(9)
+                            acv = match.group(10)
+                        elif has_tax_op == "tax_only":
+                            # Pattern with TAX but NO O&P (pattern_tax_no_op)
+                            tax = match.group(6)
+                            o_p = "0.00"  # No O&P column
+                            rcv = match.group(7)
+                            deprec = match.group(8)
+                            acv = match.group(9)
+                        else:  # "no_tax_op"
+                            # Pattern without TAX/O&P (pattern_no_tax_op)
+                            tax = "0.00"  # No tax column
+                            o_p = "0.00"  # No O&P column
+                            rcv = match.group(6)
+                            deprec = match.group(7)
+                            acv = match.group(8)
+
+                        # Combine quantity and unit
+                        quantity_unit = f"{quantity}{unit}"
+
+                        # Clean up description (remove excessive whitespace)
+                        description = re.sub(r'\s+', ' ', description)
+                        description = f"{line_num} {description}"
+
+                        # Assign trade category
                         trade = assign_trade(description)
+
                         extracted_items.append([
                             description, trade, quantity_unit, unit_price, tax, o_p, rcv, deprec, acv
                         ])
                     else:
-                        print("NO MATCH (combined):", repr(combined_line))
+                        # Only print NO MATCH for lines that start with numbers (potential line items)
+                        if re.match(r"^\d+\.\s", combined_line):
+                            print("NO MATCH (combined):", repr(combined_line[:200]))  # Truncate for readability
+
                     i = j  # Skip to next item
                 else:
                     i += 1
+
     return [HEADERS] + extracted_items
 
 

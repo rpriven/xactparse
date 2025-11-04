@@ -7,6 +7,9 @@
 !*.py
 !requirements.txt
 !LICENSE
+!CHANGELOG.md
+!STATUS.md
+!SESSION-SUMMARY-*.md
 
 # Explicitly exclude sensitive/output files (redundant but clear)
 *.pdf
@@ -16,7 +19,8 @@
 *.json
 archive/
 old/
-zundel/
+customers/
+sample-estimates/
 __pycache__/
 *.pyc
 .DS_Store
