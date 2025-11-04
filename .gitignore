@@ -1,0 +1,22 @@
+# Exclude everything by default
+*
+
+# Allow specific files
+!.gitignore
+!README.md
+!*.py
+!requirements.txt
+!LICENSE
+
+# Explicitly exclude sensitive/output files (redundant but clear)
+*.pdf
+*.xlsx
+*.xls
+*.csv
+*.json
+archive/
+old/
+zundel/
+__pycache__/
+*.pyc
+.DS_Store
